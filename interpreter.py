@@ -233,111 +233,100 @@ def step(state: State) -> State | str:
 
             frame.pc += 1
             return state
-        case jvm.Return(type=jvm.Int()):
-            v1 = frame.stack.pop()
+        case jvm.Return(type=type):
+            if type is not None: 
+                v1 = frame.stack.pop()
+                assert v1.type == type, f"expected {type}, but got {v1}"
+            
             state.frames.pop()
             if state.frames:
                 frame = state.frames.peek()
-                frame.stack.push(v1)
+                if type is not None:
+                    frame.stack.push(v1)
                 frame.pc += 1
                 return state
             else:
                 return "ok"
-
-        case jvm.Return(type=None):
-            # void return: no value to pass back
-            state.frames.pop()                 # pop callee
-            if not state.frames.items:         # no caller → program done
-                return "ok"
-            caller = state.frames.peek()
-            caller.pc += 1                     # advance caller past the callsite
-            return state
-
-        case jvm.Return(type=t):
-            # t is either None (void) or a jvm.Type (Int, Ref, etc.)
-            callee = state.frames.peek()
-
-            # Pull return value iff non-void
-            ret_v = None
-            if t is not None:
-                ret_v = callee.stack.pop()
-
-            # Pop callee frame
-            state.frames.pop()
-
-            # No caller? Top-level invocation finished.
-            if not state.frames.items:
-                return "ok"
-
-            # Resume caller
-            caller = state.frames.peek()
-            if ret_v is not None:
-                caller.stack.push(ret_v)
-            caller.pc += 1
-            return state
-                
         case jvm.Cast(from_=jvm.Int(), to_=jvm.Short()):
             v1 = frame.stack.pop()
             assert v1.type == jvm.Int(), f"expected type int, but got {v1}"
             short_val = ((v1.value + 2*15) % 216) - 2*15 
             frame.stack.push(jvm.Value(type=jvm.Int(), value=short_val))
             frame.pc += 1
-            return state
-        
-        case jvm.If(condition=cond, target=tgt):
-            v2, v1 = frame.stack.pop(), frame.stack.pop()
-            tv1 = getattr(v1, "value", v1)  # raw int
-            tv2 = getattr(v2, "value", v2)  # raw int
-
+            return state     
+        case jvm.If(condition=cond, target=t):
+            v2 = frame.stack.pop()
+            v1 = frame.stack.pop()
             c = (cond or "").lower()
-            if   c == "eq": take = (tv1 == tv2)
-            elif c == "ne": take = (tv1 != tv2)
-            elif c == "lt": take = (tv1 <  tv2)
-            elif c == "le": take = (tv1 <= tv2)
-            elif c == "gt": take = (tv1 >  tv2)
-            elif c == "ge": take = (tv1 >= tv2)
+            if isinstance(v1.type, jvm.Int) and isinstance(v2.type, jvm.Int):
+                if c == "eq":
+                     take =  (v1.value == v2.value)
+                elif c == "ne":
+                    take =  (v1.value != v2.value)
+                elif c == "lt":
+                    take =  (v1.value < v2.value)
+                elif c == "le":
+                    take =  (v1.value <= v2.value)
+                elif c == "gt":
+                    take =  (v1.value > v2.value)
+                elif c == "ge":
+                    take =  (v1.value >= v2.value)
+                else:
+                    raise NotImplementedError(f"Unknown If condition: {cond!r}")
+            elif isinstance(v1.type, jvm.Reference) and isinstance(v2.type, jvm.Reference):
+                if c == "is":
+                    take = (v1 == v2)
+                elif c == "isnot":
+                    take = (v1 != v2)
+                else:
+                    raise NotImplementedError(f"Unknown If condition: {cond!r}")
             else:
-                raise NotImplementedError(f"Unhandled If condition: {cond}")
-
-            frame.pc = PC(frame.pc.method, tgt) if take else (frame.pc + 1)
-            #frame.pc = _jump_pc(frame.pc.method, tgt) if take else (frame.pc + 1)
-            return state
-        
-        # if<cond> (zero-compare) style: compare single value to 0
+                raise TypeError(f"if expected two ints or two refs, got {v1}, {v2}")
+            if take:
+                frame.pc.offset = t
+            else:
+                frame.pc += 1
+            return state  
         case jvm.Ifz(condition=cond, target=tgt):
-            v = frame.stack.pop()
-            tv = getattr(v, "value", v)
-            # treat ints/bools as 0/1; unknown → nonzero (true-ish)
-            if isinstance(tv, bool): tv = 1 if tv else 0
-            try:
-                tv = int(tv)
-            except Exception:
-                tv = 1  # non-numeric counts as "true" (nonzero)
-
-            c = (cond or "").lower()
-            if   c == "eq": take = (tv == 0)
-            elif c == "ne": take = (tv != 0)
-            elif c == "lt": take = (tv <  0)
-            elif c == "le": take = (tv <= 0)
-            elif c == "gt": take = (tv >  0)
-            elif c == "ge": take = (tv >= 0)
+            v1 = frame.stack.pop()
+            cond = (cond or "").lower()
+            if isinstance(v1.type, jvm.Int):
+                match cond:
+                    case "eq":
+                        take = v1.value == 0
+                    case "ne":
+                        take = v1.value != 0
+                    case "lt":
+                        take = v1.value < 0
+                    case "le":
+                        take = v1.value <= 0
+                    case "gt":
+                        take = v1.value > 0
+                    case "ge":
+                        take = v1.value >= 0
+                    case _:
+                        raise NotImplementedError(f"Don't know how to handle the condition: {opr!r}")    
+            elif isinstance(v1.type, jvm.Reference):
+                if cond == "is":
+                    take = (v1 == 0)
+                elif c == "isnot":
+                    take = (v1 != 0)
             else:
-                raise NotImplementedError(f"Unhandled IfZ condition: {cond}")
-
-            frame.pc = PC(frame.pc.method, tgt) if take else (frame.pc + 1)
-            #frame.pc = _jump_pc(frame.pc.method, tgt) if take else (frame.pc + 1)
-            return state
-                
+                raise TypeError(f"ifz expected int or ref, but got {v1}")
+        
+            if take:
+                frame.pc.offset = tgt
+            else:
+                frame.pc += 1
+            return state   
         case jvm.Goto(target=tgt):
             frame.pc = PC(frame.pc.method, tgt) 
             #frame.pc = _jump_pc(frame.pc.method, tgt)
             return state
-
         case jvm.Load(type=t, index=i):
             frame.stack.push(frame.locals[i])
             frame.pc += 1
             return state
-
         case jvm.Store(type=t, index=i):
             # pop value to store
             val = frame.stack.pop()
@@ -495,9 +484,6 @@ def step(state: State) -> State | str:
             return state
             #raise NotImplementedError("InvokeSpecial not implemented yet" + "This is m:"+repr(m) + "This is obj:"+repr(obj))
 
-            
-            
-
         case jvm.InvokeStatic(method=m):
                 # 1) Determine arity from the method signature object
             #    (jpamb encodes params on m.extension.params)
@@ -612,6 +598,7 @@ def step(state: State) -> State | str:
             assert False, "Get instance field not implemented"
 
         case a:
+            a.help()
             raise NotImplementedError(f"Don't know how to handle: {a!r}")
 
 frame = Frame.from_method(methodid)
