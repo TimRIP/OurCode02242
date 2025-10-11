@@ -197,7 +197,12 @@ def _is_void_type(t) -> bool:
     return s in {"v", "void", "returnvoid"}
 
 def step(state: State) -> State | str:
-    assert isinstance(state, State), f"expected frame but got {state}"
+    #assert isinstance(state, State), f"expected frame but got {state}"
+    if isinstance(state, str):
+        # If the program is already finished (state is an error string or "ok"), 
+        # return the result immediately to prevent crashing on the next line.
+        return state
+    
     frame = state.frames.peek()
     opr = bc[frame.pc]
     logger.debug(f"STEP {opr}\n{state}")
@@ -649,7 +654,7 @@ state = State(heap, Stack.empty().push(frame))
 
 # constant for infiite loop detection, if exceeded then infinite loop is likely the case.
 MAX_INSTRUCTIONS = 10_000_000
-
+instruction_count = 0
 
 # infinite loop detection
 while isinstance(state, State):
@@ -673,3 +678,6 @@ for x in range(1000000):
         break
     else:
         print("*")
+        
+        
+
