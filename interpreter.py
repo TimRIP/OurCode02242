@@ -1,10 +1,15 @@
+# Fix Python import path for jpamb runner
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import jpamb
 from jpamb import jvm
 from dataclasses import dataclass
-
-import sys
+from solutions.SignSet import SignSet, Arithmetic
 from loguru import logger
+from typing import Iterable
 
+from typing import Iterable
 logger.remove()
 logger.add(sys.stderr, format="[{level}] {message}")
 
@@ -12,6 +17,7 @@ logger.add(sys.stderr, format="[{level}] {message}")
 ASSERTIONS_ENABLED = True
 
 methodid, input = jpamb.getcase()
+
 
 @dataclass
 class PC:
@@ -109,12 +115,6 @@ class Frame:
 
     def from_method(method: jvm.AbsMethodID) -> "Frame":
         return Frame({}, Stack.empty(), PC(method, 0))
-
-# Tiny object handle we can tag with a class name
-#class _ObjRef:
-#    __slots__ = ("class_name",)
-#    def __init__(self, class_name: str):
-#        self.class_name = class_name
 
 @dataclass
 class State:
@@ -600,6 +600,113 @@ def step(state: State) -> State | str:
         case a:
             a.help()
             raise NotImplementedError(f"Don't know how to handle: {a!r}")
+        
+##############################
+# --------------------------------------------------------------------
+# Abstract interpretation layer (Sign abstraction)
+# --------------------------------------------------------------------
+from typing import Iterable
+from solutions.SignSet import SignSet
+
+@dataclass
+class AState:
+    """Abstract JVM frame: locals, stack (SignSet), program counter, and status."""
+    pc: int
+    locals: dict[int, SignSet]
+    stack: list[SignSet]
+    status: str = "ok"  # "ok", "err", or "bot"
+
+    def copy(self) -> "AState":
+        return AState(self.pc, self.locals.copy(), self.stack.copy(), self.status)
+
+    def __or__(self, other: "AState") -> "AState":
+        """Join (⊔): merge locals and stack pointwise."""
+        assert self.pc == other.pc
+        joined_locals = {
+            k: (self.locals.get(k, SignSet(set())) | other.locals.get(k, SignSet(set())))
+            for k in set(self.locals) | set(other.locals)
+        }
+        joined_stack = [
+            (a | b) for a, b in zip(self.stack, other.stack)
+        ]
+        status = "err" if ("err" in (self.status, other.status)) else "ok"
+        return AState(self.pc, joined_locals, joined_stack, status)
+
+
+def stepA(state: AState) -> Iterable[AState]:
+    """
+    Abstract version of step(state). Returns multiple possible successors.
+    Uses SignSet operations instead of concrete integers.
+    """
+    successors = []
+
+    # Toy abstract program for demonstration
+    # 0: push +1
+    # 1: load local 0
+    # 2: add
+    # 3: ifz lt target=5
+    # 4: return ok
+    # 5: assertion error
+    op = state.pc
+
+    if op == 0:
+        s = state.copy()
+        s.stack.append(SignSet.abstract({+1}))
+        s.pc = 1
+        successors.append(s)
+
+    elif op == 1:
+        s = state.copy()
+        s.stack.append(s.locals.get(0, SignSet(set())))
+        s.pc = 2
+        successors.append(s)
+
+    elif op == 2:
+        s = state.copy()
+        b = s.stack.pop()
+        a = s.stack.pop()
+        s.stack.append(a + b)
+        s.pc = 3
+        successors.append(s)
+
+    elif op == 3:
+        # Abstract ifz: may take or not take
+        s1 = state.copy()  # taken
+        s2 = state.copy()  # not taken
+        s1.pc = 5  # jump to error branch
+        s2.pc = 4  # next instruction
+        successors.extend([s1, s2])
+        
+
+    elif op == 4:
+        s = state.copy()
+        s.status = "ok"
+        successors.append(s)
+
+    elif op == 5:
+        s = state.copy()
+        s.status = "err"
+        successors.append(s)
+
+    return successors
+
+
+def many_step(states: dict[int, AState]) -> dict[int, AState]:
+    """
+    Apply abstract stepA() to all abstract states and merge successors.
+    """
+    new_states = dict(states)
+
+    for pc, state in states.items():
+        for succ in stepA(state):
+            if succ.pc in new_states:
+                new_states[succ.pc] = new_states[succ.pc] | succ
+            else:
+                new_states[succ.pc] = succ
+
+    return new_states
+
+#############################        
 
 frame = Frame.from_method(methodid)
 heap: dict[int, jvm.Value] = {}
@@ -649,4 +756,32 @@ for x in range(1000000):
         print(state)
         break
 else:
+    
     print("*")
+
+if __name__ == "__main__":
+
+    # Initial abstract state
+    init_state = AState(
+        pc=0,
+        locals={0: SignSet({"+", "-", "0"})},
+        stack=[],
+        
+        status="ok",
+    )
+
+    states = {0: init_state}
+
+    print("\n=== Starting abstract interpretation ===")
+    for i in range(5):
+        print(f"\n--- Step {i} ---")
+        for pc, st in states.items():
+            print(f"PC={pc}, Locals={st.locals}, Stack={st.stack}, Status={st.status}")
+        states = many_step(states)
+    statuses = {st.status for st in states.values()}    
+
+    #if any(st.status == "err" for st in states.values()):
+    if "err" in statuses and "ok" not in statuses:
+        print("assertion error")
+    else:
+        print("Ok")
