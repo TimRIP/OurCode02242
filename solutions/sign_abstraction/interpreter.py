@@ -1,12 +1,14 @@
 from dataclasses import dataclass
 from typing import Literal, TypeAlias, Union, Optional, List, Dict, Tuple
+from unittest import case
 import jpamb
+import numbers
 from jpamb import jvm
 
 # -------------------------
 # Sign lattice definitions
 # -------------------------
-Sign: TypeAlias = Literal["+", "-", "0", "TOP", "BOT"]
+Sign: TypeAlias = Literal["+", "-", "0", "NZ", "TOP", "BOT"]
 
 def sign_of_int(x: int) -> Sign:
     if x > 0:
@@ -16,48 +18,75 @@ def sign_of_int(x: int) -> Sign:
     return "0"
 
 def sign_join(a: Sign, b: Sign) -> Sign:
-    if a == b:
-        return a
-    if a == "BOT":
-        return b
-    if b == "BOT":
-        return a
-    return "TOP"
+    if a == b: return a
+    if a == "BOT": return b
+    if b == "BOT": return a
+    # unions:
+    A, B = _to_set(a), _to_set(b)
+    return _from_set(A | B)
 
 def sign_add(a: Sign, b: Sign) -> Sign:
-    if a == "BOT" or b == "BOT": return "BOT"
-    if a == "TOP" or b == "TOP": return "TOP"
+    if "BOT" in (a,b): return "BOT"
+    if "TOP" in (a,b): return "TOP"
     if a == "0": return b
     if b == "0": return a
-    if a == b: return a
-    if a == "-" and b == "-": return "-"
-    if a == "+" and b == "+": return "+"
+    # + + + = + ; - + - = -
+    if a == b and a in {"+","-"}: return a
+    # any mix with NZ or +/- conflict → could be -,0,+
+    if "NZ" in (a,b) or (a in {"+","-"} and b in {"+","-"} and a != b):
+        return "TOP"
     return "TOP"
 
 def sign_sub(a: Sign, b: Sign) -> Sign:
-    if a == "BOT" or b == "BOT": return "BOT"
-    if a == "TOP" or b == "TOP": return "TOP"
-    if a == "0" and b == "0": return "0"
-    if a == "0": return "TOP"
+    if "BOT" in (a,b): return "BOT"
+    if "TOP" in (a,b): return "TOP"
     if b == "0": return a
-    if a == b: return "TOP"
-    if a == "+" and b == "-": return "+"
-    if a == "-" and b == "+": return "-"
+    if a == "0":
+        if b in {"+","-"}: return "-" if b == "+" else "+"
+        if b == "NZ": return "TOP"
+        return "0"
+    if a in {"+","-"} and b in {"+","-"}:
+        if a == b: return "TOP"    # could be 0
+        return a                   # + - - = + ; - - + = -
+    if b == "NZ": return "TOP"
+    if a == "NZ": return "TOP"
     return "TOP"
 
 def sign_mul(a: Sign, b: Sign) -> Sign:
-    if a == "BOT" or b == "BOT": return "BOT"
-    if a == "TOP" or b == "TOP": return "TOP"
-    if a == "0" or b == "0": return "0"
+    if "BOT" in (a,b): return "BOT"
+    if "0" in (a,b): return "0"
+    if "TOP" in (a,b): return "TOP"
+    # Now a,b in {+,-,NZ}
+    if a == "NZ" or b == "NZ":
+        # NZ * (+/-/NZ) is NZ
+        return "NZ"
     return "+" if a == b else "-"
 
 def sign_div(a: Sign, b: Sign) -> Sign:
-    # division by zero -> BOT (error) handled outside
-    if a == "BOT" or b == "BOT": return "BOT"
+    # caller already checks b != 0
+    if "BOT" in (a,b): return "BOT"
     if a == "0": return "0"
-    if a == "TOP" or b == "TOP": return "TOP"
-    return "+" if a == b else "-"
+    if "TOP" in (a,b): return "TOP"
+    # b in {+,-,NZ}
+    if b == "NZ":
+        if a in {"+","-","NZ"}: return "NZ"
+        return "0"  # already handled a==0 above
+    # b is + or -
+    if a == "NZ": return "NZ"
+    if a in {"+","-"}: return "+" if a == b else "-"
+    return "TOP"
 
+def sign_rem(sa: Sign, sb: Sign) -> Sign:
+    # Caller already guards sb == "0"
+    if sa == "0":
+        return "0"
+    # In Java/C#, remainder sign follows the dividend’s sign when divisor ≠ 0.
+    # Keep it conservative for abstract signs:
+    if sa in {"+", "-"}:
+        return sa            # optional: return "NZ" if you use that lattice
+    if sa == "NZ":
+        return "NZ"
+    return "TOP"
 # -------------------------
 # Value and heap models
 # -------------------------
@@ -105,33 +134,65 @@ class State:
 # Helpers: condition evaluation
 # -------------------------
 # Return "true", "false", or "maybe"
+
+
+def mk_int(sign: str, const: int | None = None):
+    # reduced product of Sign × Const
+    if const is not None:
+        # constant dictates sign
+        sign = '0' if const == 0 else ('+' if const > 0 else '-')
+        return ('int', sign, const)
+    # optional tightening: if sign is '0', const must be 0
+    if sign == '0':
+        return ('int', '0', 0)
+    return ('int', sign)
+
+def _is_int(v) -> bool:
+    return isinstance(v, tuple) and len(v) >= 2 and v[0] == 'int'
+
+def _exact(v) -> int | None:
+    """Return the concrete integer if known, else None.
+    Works for ('int', sign) and ('int', sign, exact)."""
+    if not (isinstance(v, tuple) and len(v) >= 2 and v[0] == 'int'):
+        return None
+    if len(v) >= 3 and isinstance(v[2], numbers.Integral):
+        return int(v[2])
+    return None
+
+def _sign_of_exact(n: int) -> str:
+    return '0' if n == 0 else ('+' if n > 0 else '-')
+
+def _with_exact_if_known(sign: str, ex: int | None):
+    return mk_int(_sign_of_exact(ex), ex) if ex is not None else ('int', sign)
+
+
 def unary_sign_cond_eval(sign: Sign, cond: str) -> str:
-    # cond: "eq", "ne", "lt", "le", "gt", "ge", "is", "isnot"
     if cond == "eq":
         if sign == "0": return "true"
-        if sign in {"+", "-"}: return "false"
+        if sign in {"+", "-", "NZ"}: return "false"
         return "maybe"
     if cond == "ne":
         if sign == "0": return "false"
-        if sign in {"+", "-"}: return "true"
+        if sign in {"+", "-", "NZ"}: return "true"
         return "maybe"
     if cond == "lt":
         if sign == "-": return "true"
-        if sign in {"0", "+"}: return "false"
+        if sign in {"0", "+", "NZ"}: return "false" if sign in {"+", "NZ"} else "false" if sign == "0" else "maybe"
         return "maybe"
     if cond == "le":
         if sign in {"-", "0"}: return "true"
-        if sign == "+": return "false"
+        if sign in {"+", "NZ"}: return "false"
         return "maybe"
     if cond == "gt":
-        if sign == "+": return "true"
+        if sign in {"+", "NZ"}: return "true" if sign == "+" else "maybe"
         if sign in {"0", "-"}: return "false"
         return "maybe"
     if cond == "ge":
-        if sign in {"+", "0"}: return "true"
+        if sign in {"+", "0", "NZ"}: return "true" if sign in {"+", "0"} else "maybe"
         if sign == "-": return "false"
         return "maybe"
     return "maybe"
+
 
 def compare_two_signs(a: Sign, b: Sign, cond: str) -> str:
     # cond: 'eq', 'ne', 'lt', 'le', 'gt', 'ge'
@@ -199,10 +260,12 @@ next_heap_id = 0
 for i, v in enumerate(input_values.values):
     # jvm types: jvm.Int(), jvm.Boolean(), jvm.Char(), jvm.Array(), etc.
     if isinstance(v.type, jvm.Int) or v.type == jvm.Int():
-        init_locals[i] = ('int', sign_of_int(v.value))
+        init_locals[i] = mk_int(_sign_of_exact(v.value), v.value)
     elif isinstance(v.type, jvm.Boolean) or v.type == jvm.Boolean():
-        # booleans are ints 0/1
-        init_locals[i] = ('int', "0" if v.value == 0 else "+")
+    # booleans are ints 0/1
+        exact_bool = int(v.value)
+        init_locals[i] = mk_int("0" if exact_bool == 0 else "+", exact_bool)
+
     elif isinstance(v.type, jvm.Char) or v.type == jvm.Char():
         # normalize char input to sign of its codepoint
         ch = v.value
@@ -237,6 +300,164 @@ for i, v in enumerate(input_values.values):
 initial_frame = Frame(locals=init_locals, stack=[], pc=PC(methodid, 0))
 initial_state = State(frames=[initial_frame], heap=init_heap)
 
+# ---- exact-value helpers ----
+
+def refine_local_in_state(st, idx: int, cond: str, branch_is_true: bool):
+    """
+    Narrow the abstract sign of local `idx` given a zero-comparison condition.
+    Keep exact value when consistent; force exact 0 when narrowed to '0'.
+    """
+    if idx is None:
+        return
+    fr = st.frames[-1]
+    val = fr.locals.get(idx, ('int', 'TOP'))
+    if not (isinstance(val, tuple) and val and val[0] == 'int'):
+        return
+    old_sign = val[1]
+    old_ex   = _exact(val)
+    new_sign = narrow_by_zero_test(old_sign, cond, branch_is_true)
+
+    # Keep / adjust exact value
+    if new_sign == '0':
+        fr.locals[idx] = mk_int('0', 0)
+    else:
+        # keep old exact only if it’s compatible with the new sign
+        keep_ex = old_ex
+        if keep_ex is not None:
+            if new_sign == '+' and keep_ex <= 0: keep_ex = None
+            elif new_sign == '-' and keep_ex >= 0: keep_ex = None
+            elif new_sign == 'NZ' and keep_ex == 0: keep_ex = None
+        fr.locals[idx] = mk_int(new_sign, keep_ex)
+
+def _refine_stack_top_in_state(st, cond: str, branch_is_true: bool):
+    """
+    Narrow the abstract sign of the stack top (handles DUP patterns).
+    """
+    fr = st.frames[-1]
+    if not fr.stack:
+        return
+    val = fr.stack[-1]
+    if not (isinstance(val, tuple) and val and val[0] == 'int'):
+        return
+    old_sign = val[1]
+    old_ex   = _exact(val)
+    new_sign = narrow_by_zero_test(old_sign, cond, branch_is_true)
+
+    if new_sign == '0':
+        fr.stack[-1] = mk_int('0', 0)
+    else:
+        keep_ex = old_ex
+        if keep_ex is not None:
+            if new_sign == '+' and keep_ex <= 0: keep_ex = None
+            elif new_sign == '-' and keep_ex >= 0: keep_ex = None
+            elif new_sign == 'NZ' and keep_ex == 0: keep_ex = None
+        fr.stack[-1] = mk_int(new_sign, keep_ex)
+
+
+def find_tested_local_for_ifz(frame, max_steps: int = 8) -> int | None:
+    """
+    Look backward from PC to find the producer of the value tested by If/Ifz (x <op> 0).
+    If it's an int local load, return its index; otherwise None.
+    Robust: does not rely on jvm.Nop existing; handles DUP by class name.
+    """
+    off = frame.pc.offset
+    for step in range(1, max_steps + 1):
+        idx = off - step
+        if idx < 0:
+            break
+        try:
+            instr = get_opcode(frame.pc.method, idx)
+        except Exception:
+            break
+
+        name = instr.__class__.__name__.lower()
+
+        # Skip DUP variants if present (Dup, DupX1, DupX2, etc.)
+        if name.startswith("dup"):
+            continue
+
+        # Direct int local load → found the tested local
+        if isinstance(instr, jvm.Load) and (isinstance(instr.type, jvm.Int) or instr.type == jvm.Int()):
+            return instr.index
+
+        # If it’s pushing a constant int (iconst/ldc int), there’s no local to refine
+        if isinstance(instr, jvm.Push) and isinstance(getattr(instr, "value", None), int):
+            return None
+
+        # If we hit arithmetic (e.g., isub), stop — value was computed, not a plain local
+        if isinstance(instr, jvm.Binary):
+            return None
+
+        # Unknown producer → stop conservatively
+        break
+
+    return None
+
+
+def _just_loaded_int_local(frame) -> int | None:
+    off = frame.pc.offset
+    try:
+        prev = get_opcode(frame.pc.method, off - 1)
+    except Exception:
+        return None
+
+    # Direct load just before Ifz
+    if isinstance(prev, jvm.Load) and (isinstance(prev.type, jvm.Int) or prev.type == jvm.Int()):
+        return prev.index
+
+    # If the previous op was a binary int op, check one more back for a load
+    if isinstance(prev, jvm.Binary) and (isinstance(prev.type, jvm.Int) or prev.type == jvm.Int()):
+        try:
+            prev2 = get_opcode(frame.pc.method, off - 2)
+        except Exception:
+            return None
+        if isinstance(prev2, jvm.Load) and (isinstance(prev2.type, jvm.Int) or prev2.type == jvm.Int()):
+            return prev2.index
+
+    return None
+
+def _to_set(s: Sign) -> set[str]:
+    if s == "TOP":
+        return {"+", "-", "0"}
+    if s == "NZ":
+        return {"+", "-"}
+    if s in {"+", "-", "0"}:
+        return {s}
+    return set()  # BOT maps to empty
+
+def _from_set(S: set[str]) -> Sign:
+    if not S:
+        return "BOT"
+    if S == {"+", "-", "0"}:
+        return "TOP"
+    if S == {"+", "-"}:
+        return "NZ"
+    if len(S) == 1:
+        return next(iter(S))  # '+', '-', or '0'
+    # any other 2-element mixture with '0' becomes TOP
+    return "TOP"
+
+def narrow_by_zero_test(cur: Sign, op: str, branch_is_true: bool) -> Sign:
+    S = _to_set(cur)
+
+    true_sets = {
+        "eq": {"0"},
+        "ne": {"+", "-"},    # non-zero
+        "lt": {"-"},
+        "le": {"-", "0"},
+        "gt": {"+"},
+        "ge": {"+", "0"},
+    }
+
+    if op not in true_sets:
+        return cur
+
+    if branch_is_true:
+        S2 = S & true_sets[op]
+    else:
+        S2 = S - true_sets[op]
+
+    return _from_set(S2)
 # -------------------------
 # Step function (returns list[State] or error string)
 # -------------------------
@@ -260,9 +481,10 @@ def step_abstract(state: State) -> Union[List[State], str]:
         case jvm.Push(value=v):
             # push abstract representation
             if isinstance(v.type, jvm.Int) or v.type == jvm.Int():
-                push(('int', sign_of_int(v.value)))
+               push(mk_int(_sign_of_exact(v.value), v.value))
             elif isinstance(v.type, jvm.Boolean) or v.type == jvm.Boolean():
-                push(('int', "0" if v.value == 0 else "+"))
+               exact_bool = int(v.value)
+               push(mk_int("0" if exact_bool == 0 else "+", exact_bool))    
             elif isinstance(v.type, jvm.Char) or v.type == jvm.Char():
                 if isinstance(v.value, str):
                     push(('char', sign_of_int(ord(v.value))))
@@ -315,35 +537,42 @@ def step_abstract(state: State) -> Union[List[State], str]:
 
         case jvm.Binary(type=jvm.Int(), operant=op):
             b = pop(); a = pop()
+            
             if a[0] != 'int' or b[0] != 'int':
-                # if not ints, produce TOP
                 res = ('int', 'TOP')
             else:
                 sa: Sign = a[1]  # type: ignore
                 sb: Sign = b[1]  # type: ignore
+                ea, eb = _exact(a), _exact(b)   # exact ints if known, else None
+
                 if op == jvm.BinaryOpr.Add:
-                    res = ('int', sign_add(sa, sb))
+                    ex = (ea + eb) if (ea is not None and eb is not None) else None
+                    res = _with_exact_if_known(sign_add(sa, sb), ex)
+
                 elif op == jvm.BinaryOpr.Sub:
-                    # Note: concrete did pop v2, v1 then v1 - v2; we popped in same order
-                    res = ('int', sign_sub(sa, sb))
+                    ex = (ea - eb) if (ea is not None and eb is not None) else None
+                    res = _with_exact_if_known(sign_sub(sa, sb), ex)
+
                 elif op == jvm.BinaryOpr.Mul:
-                    res = ('int', sign_mul(sa, sb))
+                    ex = (ea * eb) if (ea is not None and eb is not None) else None
+                    res = _with_exact_if_known(sign_mul(sa, sb), ex)
+
                 elif op == jvm.BinaryOpr.Div:
-                    # if divisor definitely zero -> error
-                    if sb == "0":
+                    # definite divide-by-zero if exact divisor is 0, OR sign is definitely '0'
+                    if (eb is not None and eb == 0) or sb == "0":
                         return "divide by zero"
-                    # else proceed and push abstract result
-                    res = ('int', sign_div(sa, sb))
+                    ex = (ea // eb) if (ea is not None and eb is not None and eb != 0) else None
+                    res = _with_exact_if_known(sign_div(sa, sb), ex)
+
                 elif op == jvm.BinaryOpr.Rem:
-                    if sb == "0":
+                    if (eb is not None and eb == 0) or sb == "0":
                         return "divide by zero"
-                    # remainder sign is hard to compute precisely; approximate:
-                    if sa == "0":
-                        res = ('int', '0')
-                    else:
-                        res = ('int', 'TOP')
+                    ex = (ea % eb) if (ea is not None and eb is not None and eb != 0) else None
+                    res = _with_exact_if_known(sign_rem(sa, sb), ex)
+
                 else:
                     res = ('int', 'TOP')
+
             push(res)
             frame.pc += 1
             return [state]
@@ -362,27 +591,99 @@ def step_abstract(state: State) -> Union[List[State], str]:
             else:
                 return ["ok"]
 
-        case jvm.Get(static=True):
-            # handle $assertionsDisabled style read
-            name = op.field.fieldid.name
-            if name == "$assertionsDisabled":
-                push(('int', '0' if True else '1'))  # we assume assertions enabled -> push boolean 0
+
+        case jvm.Get(field=f, static=True):
+            # Resolve field name robustly (works with f.fieldid.name or f.name)
+            field_name = None
+            fid = getattr(f, "fieldid", None)
+            if fid is not None:
+                field_name = getattr(fid, "name", None)
+            if field_name is None:
+                field_name = getattr(f, "name", None)
+
+            if field_name == "$assertionsDisabled":
+                # Enable assertions: $assertionsDisabled == false (0)
+                push(mk_int("0", 0))   # exact 0 so If/Ifz sees it precisely
                 frame.pc += 1
                 return [state]
-            # fallback: push 0
-            push(('int', '0'))
+
+            # Unknown static field → conservative TOP
+            push(('int', 'TOP'))
             frame.pc += 1
             return [state]
+    
+        case jvm.Get(field=f):
+            # Either mirror your concrete interpreter ("exception"),
+            # or conservatively push TOP. Choose ONE to be consistent.
+            return "exception"   # (or: push(('int','TOP')); frame.pc += 1; return [state])
+
 
         case jvm.Ifz(condition=cond, target=tgt):
+            # Pop the tested value (integer compared against 0)
             v1 = pop()
-            # cond is a str like 'eq','ne','lt', etc.
-            c = (cond or "").lower()
-            if v1[0] == 'int':
-                res = unary_sign_cond_eval(v1[1], c)
-            elif v1[0] == 'ref':
-                # reference null checks (is/isnot style sometimes)
-                # treat None as 0; else non-zero
+            c = (cond or "").lower()   # 'eq','ne','lt','le','gt','ge'
+
+            # Detect if the previous instruction was a DUP-family op (Dup, DupX1, ...)
+            prev_was_dup = False
+            try:
+                prev = get_opcode(frame.pc.method, frame.pc.offset - 1)
+                prev_was_dup = prev.__class__.__name__.lower().startswith("dup")
+            except Exception:
+                pass
+
+            # ------------ helper: find the last 'iload <i>' producer ------------
+            def _last_loaded_int_local(frame) -> int | None:
+                off = frame.pc.offset
+                for step in range(1, 8):  # look back up to 7 ops
+                    idx = off - step
+                    if idx < 0:
+                        break
+                    try:
+                        instr = get_opcode(frame.pc.method, idx)
+                    except Exception:
+                        break
+
+                    name = instr.__class__.__name__.lower()
+
+                    # Skip DUP-family (value identical before the dup)
+                    if name.startswith("dup"):
+                        continue
+
+                    # Direct 'iload i' → that local is being tested
+                    if isinstance(instr, jvm.Load) and (isinstance(instr.type, jvm.Int) or instr.type == jvm.Int()):
+                        return instr.index
+
+                    # Constant int (iconst/ldc int) → not a local; stop the scan
+                    if isinstance(instr, jvm.Push) and isinstance(getattr(instr, "value", None), int):
+                        return None
+
+                    # Arithmetic (e.g., isub) → value computed; don't refine a local
+                    if isinstance(instr, jvm.Binary):
+                        return None
+
+                    # Unknown producer; stop conservatively
+                    break
+                return None
+            # --------------------------------------------------------------------
+
+            tested_local = _last_loaded_int_local(frame)
+
+            # ---- decide truth value, preferring exact when available ----
+            if isinstance(v1, tuple) and len(v1) >= 2 and v1[0] == 'int':
+                ex = _exact(v1)  # may be None if not a known constant
+                if ex is not None:
+                    if   c == "eq": res = "true"  if ex == 0 else "false"
+                    elif c == "ne": res = "false" if ex == 0 else "true"
+                    elif c == "lt": res = "true"  if ex < 0  else "false"
+                    elif c == "le": res = "true"  if ex <= 0 else "false"
+                    elif c == "gt": res = "true"  if ex > 0  else "false"
+                    elif c == "ge": res = "true"  if ex >= 0 else "false"
+                    else:           res = "maybe"
+                else:
+                    # fall back to your sign predicate
+                    res = unary_sign_cond_eval(v1[1], c)
+            elif isinstance(v1, tuple) and v1[0] == 'ref':
+                # Optional: handle null checks if your IR uses Ifz for refs too
                 if c == "is":
                     res = "true" if v1[1] is None else "false"
                 elif c == "isnot":
@@ -392,21 +693,44 @@ def step_abstract(state: State) -> Union[List[State], str]:
             else:
                 res = "maybe"
 
+            # ---- apply refinements & take the branch ----
             if res == "true":
+                if tested_local is not None:
+                    refine_local_in_state(state, tested_local, c, True)
+                if prev_was_dup:
+                    _refine_stack_top_in_state(state, c, True)
                 frame.pc.offset = tgt
                 return [state]
+
             if res == "false":
+                if tested_local is not None:
+                    refine_local_in_state(state, tested_local, c, False)
+                if prev_was_dup:
+                    _refine_stack_top_in_state(state, c, False)
                 frame.pc += 1
                 return [state]
-            # maybe -> fork two states
-            s_true = State(frames=[ Frame(locals=frame.locals.copy(),
-                                         stack=frame.stack.copy(),
-                                         pc=PC(frame.pc.method, tgt)) ],
-                           heap=state.heap.copy())
-            s_false = State(frames=[ Frame(locals=frame.locals.copy(),
-                                          stack=frame.stack.copy(),
-                                          pc=PC(frame.pc.method, frame.pc.offset + 1)) ],
-                            heap=state.heap.copy())
+
+            # res == "maybe" → fork & refine both paths
+            s_true = State(
+                frames=[Frame(locals=frame.locals.copy(),
+                            stack=frame.stack.copy(),
+                            pc=PC(frame.pc.method, tgt))],
+                heap=state.heap.copy()
+            )
+            s_false = State(
+                frames=[Frame(locals=frame.locals.copy(),
+                            stack=frame.stack.copy(),
+                            pc=PC(frame.pc.method, frame.pc.offset + 1))],
+                heap=state.heap.copy()
+            )
+
+            if tested_local is not None:
+                refine_local_in_state(s_true,  tested_local, c, True)
+                refine_local_in_state(s_false, tested_local, c, False)
+            if prev_was_dup:
+                _refine_stack_top_in_state(s_true,  c, True)
+                _refine_stack_top_in_state(s_false, c, False)
+
             return [s_true, s_false]
 
         case jvm.New(classname=cn):
@@ -453,46 +777,154 @@ def step_abstract(state: State) -> Union[List[State], str]:
             return "assertion error"
 
         case jvm.If(condition=cond, target=tgt):
-            # binary comparison between two values (pop v2 then v1)
-            v2 = pop(); v1 = pop()
-            c = (cond or "").lower()
-            # handle int-int comparisons
-            if v1[0] == 'int' and v2[0] == 'int':
-                res = compare_two_signs(v1[1], v2[1], c)
-            elif v1[0] == 'ref' and v2[0] == 'ref':
-                # comparing references: eq/is or isnot
-                if c == "is":
-                    if v1[1] is None and v2[1] is None: res = "true"
-                    elif v1[1] is not None and v2[1] is not None and v1[1] == v2[1]: res = "true"
-                    elif v1[1] is not None and v2[1] is not None and v1[1] != v2[1]: res = "false"
-                    else: res = "maybe"
-                elif c == "isnot":
-                    if v1[1] is None and v2[1] is None: res = "false"
-                    elif v1[1] is not None and v2[1] is not None and v1[1] == v2[1]: res = "false"
-                    elif v1[1] is not None and v2[1] is not None and v1[1] != v2[1]: res = "true"
-                    else: res = "maybe"
+            c = (cond or "").lower()   # 'eq','ne','lt','le','gt','ge'
+
+            # Helper: decide relation on exact ints
+            def _decide_exact(a: int, b: int, c: str) -> str:
+                if   c == 'eq': return 'true' if a == b else 'false'
+                elif c == 'ne': return 'true' if a != b else 'false'
+                elif c == 'lt': return 'true' if a <  b else 'false'
+                elif c == 'le': return 'true' if a <= b else 'false'
+                elif c == 'gt': return 'true' if a >  b else 'false'
+                elif c == 'ge': return 'true' if a >= b else 'false'
+                return 'maybe'
+
+            # Helper: decide relation on abstract signs
+            def _decide_signs(va, vb, c: str) -> str:
+                # va, vb are ('int', Sign[, exact?]) tuples
+                if not (_is_int(va) and _is_int(vb)):
+                    return 'maybe'
+                sa: Sign = va[1]  # type: ignore
+                sb: Sign = vb[1]  # type: ignore
+                return compare_two_signs(sa, sb, c)
+
+            # Try to detect binary form: two ints on stack
+            is_binary = False
+            if len(frame.stack) >= 2:
+                vtop = frame.stack[-1]
+                v2   = frame.stack[-2]
+                is_binary = (_is_int(vtop) and _is_int(v2))
+
+            if is_binary:
+                # ---- BINARY COMPARE: pop b then a; test a ? b ----
+                b = pop()
+                a = pop()
+
+                # Prefer exact values when both known
+                ea, eb = _exact(a), _exact(b)
+                if ea is not None and eb is not None:
+                    res = _decide_exact(ea, eb, c)
                 else:
-                    res = "maybe"
+                    # fall back to sign relation
+                    res = _decide_signs(a, b, c)
+
+                # No local/dup refinements here (binary compare result doesn't single out one producer cleanly)
+                if res == 'true':
+                    frame.pc.offset = tgt
+                    return [state]
+                if res == 'false':
+                    frame.pc += 1
+                    return [state]
+
+                # maybe → fork
+                s_true = State(
+                    frames=[Frame(locals=frame.locals.copy(),
+                                stack=frame.stack.copy(),
+                                pc=PC(frame.pc.method, tgt))],
+                    heap=state.heap.copy()
+                )
+                s_false = State(
+                    frames=[Frame(locals=frame.locals.copy(),
+                                stack=frame.stack.copy(),
+                                pc=PC(frame.pc.method, frame.pc.offset + 1))],
+                    heap=state.heap.copy()
+                )
+                return [s_true, s_false]
+
             else:
-                res = "maybe"
+                # ---- UNARY ZERO-COMPARE: pop v1; test v1 ? 0 ----
+                v1 = pop()
 
-            if res == "true":
-                frame.pc.offset = tgt
-                return [state]
-            if res == "false":
-                frame.pc += 1
-                return [state]
-            # maybe -> fork
-            s_true = State(frames=[ Frame(locals=frame.locals.copy(),
-                                         stack=frame.stack.copy(),
-                                         pc=PC(frame.pc.method, tgt)) ],
-                           heap=state.heap.copy())
-            s_false = State(frames=[ Frame(locals=frame.locals.copy(),
-                                          stack=frame.stack.copy(),
-                                          pc=PC(frame.pc.method, frame.pc.offset + 1)) ],
-                            heap=state.heap.copy())
-            return [s_true, s_false]
+                # Detect DUP-family (Dup, DupX1, ...) to refine the remaining copy
+                prev_was_dup = False
+                try:
+                    prev = get_opcode(frame.pc.method, frame.pc.offset - 1)
+                    prev_was_dup = prev.__class__.__name__.lower().startswith("dup")
+                except Exception:
+                    pass
 
+                # Back-scan for a direct iload to refine that local
+                def _last_loaded_int_local(frame) -> int | None:
+                    off = frame.pc.offset
+                    for step in range(1, 8):
+                        idx = off - step
+                        if idx < 0: break
+                        try:
+                            instr = get_opcode(frame.pc.method, idx)
+                        except Exception:
+                            break
+                        name = instr.__class__.__name__.lower()
+                        if name.startswith("dup"):
+                            continue
+                        if isinstance(instr, jvm.Load) and (isinstance(instr.type, jvm.Int) or instr.type == jvm.Int()):
+                            return instr.index
+                        if isinstance(instr, jvm.Push) and isinstance(getattr(instr, "value", None), int):
+                            return None
+                        if isinstance(instr, jvm.Binary):
+                            return None
+                        break
+                    return None
+
+                tested_local = _last_loaded_int_local(frame)
+
+                # Decide truth preferring exact
+                if _is_int(v1):
+                    ex = _exact(v1)
+                    if ex is not None:
+                        res = _decide_exact(ex, 0, c)
+                    else:
+                        res = unary_sign_cond_eval(v1[1], c)  # type: ignore
+                else:
+                    res = 'maybe'
+
+                # Apply refinements & branch
+                if res == 'true':
+                    if tested_local is not None:
+                        refine_local_in_state(state, tested_local, c, True)
+                    if prev_was_dup:
+                        _refine_stack_top_in_state(state, c, True)
+                    frame.pc.offset = tgt
+                    return [state]
+
+                if res == 'false':
+                    if tested_local is not None:
+                        refine_local_in_state(state, tested_local, c, False)
+                    if prev_was_dup:
+                        _refine_stack_top_in_state(state, c, False)
+                    frame.pc += 1
+                    return [state]
+
+                # maybe → fork & refine
+                s_true = State(
+                    frames=[Frame(locals=frame.locals.copy(),
+                                stack=frame.stack.copy(),
+                                pc=PC(frame.pc.method, tgt))],
+                    heap=state.heap.copy()
+                )
+                s_false = State(
+                    frames=[Frame(locals=frame.locals.copy(),
+                                stack=frame.stack.copy(),
+                                pc=PC(frame.pc.method, frame.pc.offset + 1))],
+                    heap=state.heap.copy()
+                )
+                if tested_local is not None:
+                    refine_local_in_state(s_true,  tested_local, c, True)
+                    refine_local_in_state(s_false, tested_local, c, False)
+                if prev_was_dup:
+                    _refine_stack_top_in_state(s_true,  c, True)
+                    _refine_stack_top_in_state(s_false, c, False)
+                return [s_true, s_false]
+    
         case jvm.Goto(target=tgt):
             frame.pc.offset = tgt
             return [state]
@@ -673,11 +1105,16 @@ def step_abstract(state: State) -> Union[List[State], str]:
                     frame.locals[i] = ('int', sign_add(val[1], sd))
             frame.pc += 1
             return [state]
+        
+        case jvm.Get(field=f, static=True):
+            if getattr(f, "name", None) == "$assertionsDisabled":
+                push(mk_int("+", 1))  # boolean true (assertions DISABLED by default)
+                frame.pc += 1
+                return [state]
+            push(('int', 'TOP'))
+            frame.pc += 1
+            return [state]
 
-        case jvm.Get(field=f) if not getattr(op, "static", False):
-            # Instance field get not implemented in abstract -> conservatively TOP
-            # But concrete interpreter asserted instance fields not implemented - we mimic that
-            return "exception"
 
         case jvm.InvokeStatic(method=m):
             # pop args and create callee frame
