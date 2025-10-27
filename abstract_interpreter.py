@@ -707,44 +707,54 @@ def step_abstract(state: State) -> Union[List[State], str]:
     # default fallback
     return [state]
 
-# -------------------------
-# Worklist interpreter
-# -------------------------
 def run_worklist(initial: State):
     worklist: List[State] = [initial]
-    visited = set()  # to avoid infinite loops: store (method,offset,locals items) signatures
+    visited = set()
+    reached_exit = False
+    reached_error: Optional[str] = None
 
     while worklist:
         st = worklist.pop()
-        # create a simple state key
+        if not st.frames:
+            reached_exit = True
+            continue
+
         frame = st.frames[-1]
-        key = (frame.pc.method, frame.pc.offset, tuple(sorted((k, v) for k,v in frame.locals.items())))
+        key = (frame.pc.method, frame.pc.offset, frozenset(frame.locals.items()))
         if key in visited:
             continue
         visited.add(key)
 
         res = step_abstract(st)
-        # If res is a string error, print and exit
+
+        # If step_abstract reports a string, it's an error
         if isinstance(res, str):
-            print(res)
-            return
-        # res is a list of next states
+            reached_error = res
+            break
+
         for nxt in res:
-            # special sentinel "ok" or "done"
             if isinstance(nxt, str):
                 if nxt == "ok":
-                    continue
+                    reached_exit = True
                 else:
-                    # other strings -> print and exit
-                    print(nxt)
-                    return
-            # check if nxt finished by empty frames -> treat as ok
-            if not nxt.frames:
-                continue
-            # push next into worklist
-            worklist.append(nxt)
-    # no errors found on any path -> ok
-    print("ok")
+                    reached_error = nxt
+                    break
+            elif not nxt.frames:
+                reached_exit = True
+            else:
+                worklist.append(nxt)
+
+        if reached_error:
+            break
+
+    # --- decide final verdict ---
+    if reached_error:
+        print(reached_error)
+    elif reached_exit:
+        print("ok")
+    else:
+        # no exit, no error -> infinite loop
+        print("*")
 
 # run
 run_worklist(initial_state)
