@@ -9,6 +9,8 @@ from jpamb import jvm
 # -------------------------
 Sign: TypeAlias = Literal["+", "-", "0", "TOP", "BOT"]
 
+warnings = []
+
 def sign_of_int(x: int) -> Sign:
     if x > 0:
         return "+"
@@ -302,7 +304,7 @@ def step_abstract(state: State) -> Union[List[State], str]:
                     if sb == "0":
                         return "divide by zero"
                     if sb == "TOP":
-                        print("possible divide by zero")
+                        warnings.append("possible divide by zero")
                     # else proceed and push abstract result
                     res = ('int', sign_div(sa, sb))
                 elif op == jvm.BinaryOpr.Rem:
@@ -712,6 +714,10 @@ def run_worklist_result(initial: State) -> str:
 
 def analyze_method_no_inputs(methodid: jvm.AbsMethodID) -> str:
     """Entry for analyzer/test mode (no concrete inputs)."""
+    warnings.clear()
     return run_worklist_result(build_initial_state_from_sig(methodid))
 
 
+def get_abstract_warnings() -> List[str]:
+    """Return list of warning strings emitted during analysis."""
+    return warnings
